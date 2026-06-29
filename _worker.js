@@ -1,4 +1,4 @@
-import { connect } from "cloudflare:sockets";
+1import { connect } from "cloudflare:sockets";
 
 // ======================== 默认配置 ========================
 const DEFAULT_SUB_PATH = "订阅路径";

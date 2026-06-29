@@ -1,290 +1,363 @@
 import { connect } from "cloudflare:sockets";
 
-// 配置区块
-let 订阅路径 = "订阅路径";
-let 伪装网页;
-let 验证UUID;
-let 反代IP = "proxyip.cmliussss.net";
+// ======================== 默认配置 ========================
+const DEFAULT_SUB_PATH = "订阅路径";
+const DEFAULT_PROXY_IP = "proxyip.cmliussss.net";
+const DEFAULT_FAKE_WEB = "";
+const DEFAULT_UUID = "";                // 强烈建议设置固定 UUID
 
-const 默认优选 = "time.is";
+const [v2ray, clash, vless] = [
+  ["v2", "ray"].join(""),
+  ["cla", "sh"].join(""),
+  ["vl", "ess"].join("")
+];
 
-// 关键词拆分(防检测)
-const 威图锐拆分 = ["v2", "ray"];
-const 科拉什拆分 = ["cla", "sh"];
-const 维列斯拆分 = ["vl", "ess"];
+// UUID 转换表（用于验证）
+const HEX_MAP = Array.from({ length: 256 }, (_, i) => (i + 256).toString(16).slice(1));
 
-const 威图锐 = 威图锐拆分.join("");
-const 科拉什 = 科拉什拆分.join("");
-const 维列斯 = 维列斯拆分.join("");
-
-// 转换密钥格式
-const 转换密钥格式 = Array.from({ length: 256 }, (_, i) => (i + 256).toString(16).slice(1));
-
-// 网页入口
+// ======================== 主程序 ========================
 export default {
-  async fetch(访问请求, env) {
-    订阅路径 = env.SUB_PATH ?? 订阅路径;
-    验证UUID = 生成UUID();
-    反代IP = env.PROXY_IP ?? 反代IP;
-    伪装网页 = env.FAKE_WEB;
+  async fetch(request, env) {
+    // ---------- 读取环境变量 ----------
+    const subPath = env.SUB_PATH ?? DEFAULT_SUB_PATH;
+    const proxyIPs = env.PROXY_IP ? env.PROXY_IP.split(",").map(s => s.trim()).filter(Boolean) : [DEFAULT_PROXY_IP];
+    const fakeWeb = env.FAKE_WEB ?? DEFAULT_FAKE_WEB;
+    const yxIPs = env.YX_IPS ? env.YX_IPS.split(",").map(s => s.trim()).filter(Boolean) : [];
+    let uuid = env.UUID ?? DEFAULT_UUID;
+    if (!uuid) {
+      console.warn("⚠️ 未设置 UUID，将从订阅路径生成（不推荐）");
+      uuid = generateUUIDFromPath(subPath);
+    }
 
-    const url = new URL(访问请求.url);
-    const 读取我的请求标头 = 访问请求.headers.get("Upgrade");
-    const WS请求 = 读取我的请求标头 == "websocket";
+    const url = new URL(request.url);
+    const isWebSocket = request.headers.get("Upgrade") === "websocket";
 
-    const 路径配置 = {
-      威图锐: `/${encodeURI(订阅路径)}/${威图锐}`,
-      科拉什: `/${encodeURI(订阅路径)}/${科拉什}`,
-      订阅聚合: `/${encodeURI(订阅路径)}/info`,
-      通用订阅: `/${encodeURI(订阅路径)}`,
-    };
+    const encodedPath = encodeURI(subPath);
+    const pathV2ray = `/${encodedPath}/${v2ray}`;
+    const pathClash  = `/${encodedPath}/${clash}`;
+    const pathInfo   = `/${encodedPath}/info`;
+    const pathRoot   = `/${encodedPath}`;
+    const isSubRequest = [pathV2ray, pathClash, pathInfo, pathRoot].includes(url.pathname);
 
-    const 是正确路径 = url.pathname === 路径配置.威图锐 ||
-                      url.pathname === 路径配置.科拉什 ||
-                      url.pathname === 路径配置.订阅聚合 ||
-                      url.pathname === `/${encodeURI(订阅路径)}`
-
-    if (!WS请求 && !是正确路径) {
-      if (伪装网页) {
+    // ---------- 伪装网页 ----------
+    if (!isWebSocket && !isSubRequest) {
+      if (fakeWeb) {
         try {
-          const targetBase = 伪装网页.startsWith('http://') || 伪装网页.startsWith('https://')
-            ? 伪装网页
-            : `https://${伪装网页}`;
-
+          const targetBase = fakeWeb.startsWith("http") ? fakeWeb : `https://${fakeWeb}`;
           const targetUrl = new URL(targetBase);
           targetUrl.pathname = url.pathname;
           targetUrl.search = url.search;
-
-          const 请求对象 = new Request(targetUrl.toString(), {
-            method: 访问请求.method,
-            headers: 访问请求.headers,
-            body: 访问请求.body,
+          const controller = new AbortController();
+          const timeout = setTimeout(() => controller.abort(), 5000);
+          const response = await fetch(targetUrl.toString(), {
+            method: request.method,
+            headers: request.headers,
+            body: request.body,
+            signal: controller.signal,
           });
-
-          const 响应对象 = await fetch(请求对象);
-          return 响应对象;
+          clearTimeout(timeout);
+          return response;
         } catch {
-          console.error(`[伪装网页请求失败] 目标: ${伪装网页}`);
           return new Response(null, { status: 404 });
         }
-      } else {
-        return new Response(null, { status: 404 });
       }
+      return new Response(null, { status: 404 });
     }
 
-    if (!WS请求) {
-      if (url.pathname === 路径配置.威图锐) {
-        return 威图锐配置文件(访问请求.headers.get("Host"));
+    // ---------- 订阅请求 ----------
+    if (!isWebSocket) {
+      const host = request.headers.get("Host") || "";
+      const ua = (request.headers.get("User-Agent") || "").toLowerCase();
+      const isV2Ray = ua.includes(v2ray);
+      const isClash = ua.includes(clash);
+
+      if (url.pathname === pathV2ray || (url.pathname === pathRoot && isV2Ray)) {
+        return generateV2RayResponse(host, uuid, yxIPs);
       }
-      else if (url.pathname === 路径配置.科拉什) {
-        return 科拉什配置文件(访问请求.headers.get("Host"));
+      if (url.pathname === pathClash || (url.pathname === pathRoot && isClash)) {
+        return generateClashResponse(host, uuid, yxIPs);
       }
-      else if (url.pathname === 路径配置.订阅聚合) {
-        return 聚合信息(访问请求.headers.get("Host"));
+      if (url.pathname === pathInfo) {
+        return generateInfoResponse(yxIPs);
       }
-      else if (url.pathname === 路径配置.通用订阅) {
-        const 用户代理 = 访问请求.headers.get("User-Agent").toLowerCase();
-        const 配置生成器 = {
-          [威图锐]: 威图锐配置文件,
-          [科拉什]: 科拉什配置文件,
-          tips: 提示界面,
-        };
-        const 工具 = Object.keys(配置生成器).find((工具) => 用户代理.includes(工具));
-        const 生成配置 = 配置生成器[工具 || "tips"];
-        return 生成配置(访问请求.headers.get("Host"));
-      }
+      return new Response(
+        `<title>订阅-${subPath}</title><style>body{font-size:25px;text-align:center;height:100vh;display:flex;align-items:center;justify-content:center}</style><strong>请把链接导入 ${clash} 或 ${v2ray}</strong>`,
+        { status: 200, headers: { "Content-Type": "text/html;charset=utf-8" } }
+      );
     }
 
-    if (WS请求) {
-      return await 升级WS请求();
+    // ---------- WebSocket 代理（VLESS） ----------
+    if (isWebSocket) {
+      return handleWebSocket(request, uuid, proxyIPs);
     }
   },
 };
 
-// 脚本主要架构
-async function 升级WS请求() {
-  const [客户端, WS接口] = Object.values(new WebSocketPair());
-  WS接口.accept();
-  WS接口.binaryType = "arraybuffer";
-  WS接口.send(new Uint8Array([0, 0]));
-  启动传输管道(WS接口);
-  return new Response(null, { status: 101, webSocket: 客户端 });
-}
+// ======================== WebSocket 代理核心（优化版） ========================
+async function handleWebSocket(request, uuid, proxyIPs) {
+  const [client, server] = Object.values(new WebSocketPair());
+  server.accept();
+  server.binaryType = "arraybuffer";
 
-async function 启动传输管道(WS接口) {
-  let TCP接口;
-  let 首包数据 = true;
-  let 处理队列 = Promise.resolve();
-  let 传输数据;
+  // 发送 VLESS 握手包
+  server.send(new Uint8Array([0, 0]));
 
-  WS接口.addEventListener("message", (event) => {
-    处理队列 = 处理队列.then(async () => {
-      if (首包数据) {
-        首包数据 = false;
-        await 解析VL标头(event.data);
-      } else {
-        await 传输数据.write(event.data);
+  let tcpSocket = null;
+  let writer = null;
+  let firstPacket = true;
+
+  // ---------- 心跳：使用 WebSocket Ping 帧（更可靠） ----------
+  const pingInterval = setInterval(() => {
+    if (server.readyState === 1) {  // WebSocket.OPEN
+      try {
+        server.ping();  // 发送 Ping 帧
+      } catch (_) {
+        // 忽略可能的异常
+      }
+    }
+  }, 15000); // 15 秒一次
+
+  // 可选：监听 Pong 帧（用于日志）
+  server.addEventListener('pong', () => {
+    // 收到 pong 表示连接正常，可记录日志
+    // console.log('收到 Pong');
+  });
+
+  let queue = Promise.resolve();
+
+  server.addEventListener("message", (event) => {
+    queue = queue.then(async () => {
+      try {
+        if (firstPacket) {
+          firstPacket = false;
+          await parseVlessHeader(event.data, uuid, proxyIPs, server);
+        } else {
+          if (writer) await writer.write(event.data);
+        }
+      } catch (err) {
+        console.error("处理消息错误:", err);
+        server.close();
       }
     });
   });
 
-  async function 解析VL标头(VL数据) {
-    if (验证VL的密钥(new Uint8Array(VL数据.slice(1, 17))) !== 验证UUID) {
+  server.addEventListener("close", () => {
+    clearInterval(pingInterval);
+    if (writer) writer.close().catch(() => {});
+    if (tcpSocket) tcpSocket.close().catch(() => {});
+  });
+
+  return new Response(null, { status: 101, webSocket: client });
+
+  // ---------- 解析 VLESS 标头（保留原始解析逻辑） ----------
+  async function parseVlessHeader(data, uuid, proxyIPs, ws) {
+    const raw = new Uint8Array(data);
+    // 验证 UUID（第1~16字节）
+    const receivedUUID = bytesToUUID(raw.slice(1, 17));
+    if (receivedUUID !== uuid) {
+      console.warn("UUID 不匹配，拒绝连接");
+      ws.close();
       return;
     }
 
-    const 获取数据定位 = new Uint8Array(VL数据)[17];
-    const 提取端口索引 = 18 + 获取数据定位 + 1;
-    const 建立端口缓存 = VL数据.slice(提取端口索引, 提取端口索引 + 2);
-    const 访问端口 = new DataView(建立端口缓存).getUint16(0);
+    // ----- 原解析逻辑（从 data[17] 获取偏移） -----
+    const offsetByte = raw[17];
+    const portIndex = 18 + offsetByte + 1;
+    const portBuffer = data.slice(portIndex, portIndex + 2);
+    const port = new DataView(portBuffer).getUint16(0);
 
-    const 提取地址索引 = 提取端口索引 + 2;
-    const 建立地址缓存 = new Uint8Array(VL数据.slice(提取地址索引, 提取地址索引 + 1));
-    const 识别地址类型 = 建立地址缓存[0];
+    const addrIndex = portIndex + 2;
+    const addrType = raw[addrIndex];
 
-    let 地址长度 = 0;
-    let 访问地址 = "";
-    let 地址信息索引 = 提取地址索引 + 1;
+    let addrLen = 0;
+    let targetAddr = "";
+    let start = addrIndex + 1;
 
-    switch (识别地址类型) {
-      case 1:
-        地址长度 = 4;
-        访问地址 = new Uint8Array(VL数据.slice(地址信息索引, 地址信息索引 + 地址长度)).join(".");
+    switch (addrType) {
+      case 1: // IPv4
+        addrLen = 4;
+        targetAddr = raw.slice(start, start + addrLen).join(".");
         break;
-      case 2:
-        地址长度 = new Uint8Array(VL数据.slice(地址信息索引, 地址信息索引 + 1))[0];
-        地址信息索引 += 1;
-        访问地址 = new TextDecoder().decode(VL数据.slice(地址信息索引, 地址信息索引 + 地址长度));
+      case 2: // 域名
+        addrLen = raw[start];
+        start += 1;
+        targetAddr = new TextDecoder().decode(raw.slice(start, start + addrLen));
         break;
-      case 3:
-        地址长度 = 16;
-        const dataView = new DataView(VL数据.slice(地址信息索引, 地址信息索引 + 地址长度));
-        const ipv6 = [];
-        for (let i = 0; i < 8; i++) {
-          ipv6.push(dataView.getUint16(i * 2).toString(16));
-        }
-        访问地址 = ipv6.join(":");
+      case 3: // IPv6
+        addrLen = 16;
+        const view = new DataView(raw.buffer, start, addrLen);
+        const parts = [];
+        for (let i = 0; i < 8; i++) parts.push(view.getUint16(i * 2).toString(16));
+        targetAddr = parts.join(":");
         break;
       default:
+        console.warn("未知地址类型", addrType);
+        ws.close();
         return;
     }
 
-    const 写入初始数据 = VL数据.slice(地址信息索引 + 地址长度);
+    const initialData = data.slice(start + addrLen);
 
-    try {
-      TCP接口 = connect({ hostname: 访问地址, port: 访问端口 });
-      await TCP接口.opened;
-    } catch {
-      const [反代IP地址, 反代IP端口 = 访问端口] = 反代IP.split(":");
-      TCP接口 = connect({ hostname: 反代IP地址, port: 反代IP端口 });
-      await TCP接口.opened;
+    // ---------- 连接目标（直连 + 多反代，带超时和重试） ----------
+    let connected = false;
+    let lastError = null;
+    const targets = [{ hostname: targetAddr, port }];
+    for (const proxy of proxyIPs) {
+      const [host, p] = proxy.split(":");
+      targets.push({ hostname: host, port: p ? parseInt(p) : port });
     }
 
-    建立传输管道(写入初始数据);
-  }
-
-  function 验证VL的密钥(arr, offset = 0) {
-    const uuid = (转换密钥格式[arr[offset + 0]] + 转换密钥格式[arr[offset + 1]] + 转换密钥格式[arr[offset + 2]] + 转换密钥格式[arr[offset + 3]] + "-" + 转换密钥格式[arr[offset + 4]] + 转换密钥格式[arr[offset + 5]] + "-" + 转换密钥格式[arr[offset + 6]] + 转换密钥格式[arr[offset + 7]] + "-" + 转换密钥格式[arr[offset + 8]] + 转换密钥格式[arr[offset + 9]] + "-" + 转换密钥格式[arr[offset + 10]] + 转换密钥格式[arr[offset + 11]] + 转换密钥格式[arr[offset + 12]] + 转换密钥格式[arr[offset + 13]] + 转换密钥格式[arr[offset + 14]] + 转换密钥格式[arr[offset + 15]]).toLowerCase();
-    return uuid;
-  }
-
-  async function 建立传输管道(写入初始数据) {
-    传输数据 = TCP接口.writable.getWriter();
-
-    if (写入初始数据?.byteLength > 0) {
-      await 传输数据.write(写入初始数据);
+    for (const target of targets) {
+      try {
+        // 设置连接超时（3秒）
+        const controller = new AbortController();
+        const timeout = setTimeout(() => controller.abort(), 3000);
+        tcpSocket = connect({ hostname: target.hostname, port: target.port, signal: controller.signal });
+        await tcpSocket.opened;
+        clearTimeout(timeout);
+        writer = tcpSocket.writable.getWriter();
+        connected = true;
+        console.log(`✅ 连接成功: ${target.hostname}:${target.port}`);
+        break;
+      } catch (err) {
+        lastError = err;
+        console.warn(`⚠️ 连接失败 ${target.hostname}:${target.port}`, err.message);
+        if (tcpSocket) {
+          try { tcpSocket.close(); } catch (_) {}
+          tcpSocket = null;
+          writer = null;
+        }
+      }
     }
 
-    TCP接口.readable.pipeTo(
+    if (!connected) {
+      console.error("所有目标均不可达", lastError);
+      ws.close();
+      return;
+    }
+
+    // 发送初始数据
+    if (initialData?.byteLength > 0) {
+      await writer.write(initialData);
+    }
+
+    // ---------- 转发 TCP → WebSocket ----------
+    tcpSocket.readable.pipeTo(
       new WritableStream({
         write(chunk) {
-          WS接口.send(chunk);
+          if (ws.readyState === 1) ws.send(chunk);
+        },
+        close() {
+          console.log("TCP 流关闭");
+          if (ws.readyState === 1) ws.close();
+        },
+        abort(err) {
+          console.error("TCP 读取错误:", err);
+          if (ws.readyState === 1) ws.close();
         },
       })
-    );
+    ).catch(err => {
+      console.error("pipeTo 异常:", err);
+      if (ws.readyState === 1) ws.close();
+    });
   }
 }
 
-// UUID生成函数
-function 生成UUID() {
-  const 二十位 = Array.from(new TextEncoder().encode(订阅路径))
-    .map((byte) => byte.toString(16).padStart(2, "0"))
+// ======================== 工具函数 ========================
+function bytesToUUID(bytes) {
+  const hex = Array.from(bytes, b => HEX_MAP[b]).join("");
+  return `${hex.slice(0,8)}-${hex.slice(8,12)}-${hex.slice(12,16)}-${hex.slice(16,20)}-${hex.slice(20,32)}`.toLowerCase();
+}
+
+function generateUUIDFromPath(path) {
+  const hash = Array.from(new TextEncoder().encode(path))
+    .map(b => b.toString(16).padStart(2, "0"))
     .join("")
     .slice(0, 20)
     .padEnd(20, "0");
-
-  const 前八位 = 二十位.slice(0, 8);
-  const 后十二位 = 二十位.slice(-12);
-
-  return `${前八位}-0000-4000-8000-${后十二位}`;
+  return `${hash.slice(0,8)}-0000-4000-8000-${hash.slice(-12)}`;
 }
 
-// 订阅页面
-async function 提示界面() {
-  const 提示界面 = `
-<title>订阅-${订阅路径}</title>
-<style>
-  body {
-    font-size: 25px;
-    text-align: center;
-    margin: 0;
-    padding: 0;
-    height: 100vh;
-    width: 100vw;
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    box-sizing: border-box;
-    overflow: hidden;
-  }
-</style>
-<strong>请把链接导入 ${科拉什} 或 ${威图锐}</strong>
-`;
-
-  return new Response(提示界面, {
+// ======================== 订阅生成 ========================
+function generateV2RayResponse(host, uuid, yxIPs) {
+  const addresses = yxIPs.length ? yxIPs : [host];
+  const lines = addresses.map(addr => {
+    let [server, port = 443] = addr.split(":");
+    return `${vless}://${uuid}@${server}:${port}?encryption=none&security=tls&sni=${host}&fp=chrome&type=ws&host=${host}#${server}`;
+  });
+  return new Response(lines.join("\n"), {
     status: 200,
-    headers: { "Content-Type": "text/html;charset=utf-8" },
+    headers: { "Content-Type": "text/plain;charset=utf-8" },
   });
 }
 
-function 威图锐配置文件(hostName) {
-  let 最终地址 = hostName.endsWith('.pages.dev') ? 默认优选 : hostName;
+function generateClashResponse(host, uuid, yxIPs) {
+  const addresses = yxIPs.length ? yxIPs : [host];
+  const proxies = addresses.map(addr => {
+    let [server, port = 443] = addr.split(":");
+    const name = `CF-${server}`;
+    return {
+      name,
+      type: vless,
+      server,
+      port: parseInt(port),
+      uuid,
+      udp: true,
+      tls: true,
+      sni: host,
+      network: "ws",
+      "ws-opts": {
+        headers: { Host: host, "User-Agent": "Chrome" },
+        // 可选：增加 path 避免干扰
+        path: "/?ed=2048"
+      },
+      "mux": true,   // 开启多路复用
+    };
+  });
 
-  const 配置内容 = `${维列斯}://${验证UUID}@${最终地址}:443?encryption=none&security=tls&sni=${hostName}&fp=chrome&type=ws&host=${hostName}#${最终地址}`;
-
-  return new Response(配置内容);
-}
-
-function 科拉什配置文件(hostName) {
-  let 最终地址 = hostName.endsWith('.pages.dev') ? 默认优选 : hostName;
-
-  const 配置内容 = `
+  const proxyNames = proxies.map(p => p.name);
+  const yaml = `
 proxies:
-- name: ${最终地址}
-  type: ${维列斯}
-  server: ${最终地址}
-  port: 443
-  uuid: ${验证UUID}
-  udp: true
-  tls: true
-  sni: ${hostName}
-  network: ws
+${proxies.map(p => `- name: ${p.name}
+  type: ${p.type}
+  server: ${p.server}
+  port: ${p.port}
+  uuid: ${p.uuid}
+  udp: ${p.udp}
+  tls: ${p.tls}
+  sni: ${p.sni}
+  network: ${p.network}
   ws-opts:
     headers:
-      Host: ${hostName}
-      User-Agent: Chrome
+      Host: ${p["ws-opts"].headers.Host}
+      User-Agent: ${p["ws-opts"].headers["User-Agent"]}
+    path: ${p["ws-opts"].path}
+  mux: ${p.mux}`).join("\n")}
 
 proxy-groups:
 - name: 节点列表
-  type: select
+  type: url-test
+  url: 'https://www.google.com/generate_204'
+  interval: 30          # 30秒快速切换
+  tolerance: 10         # 延迟差10ms内不切换
   proxies:
-    - ${最终地址}
+${proxyNames.map(n => `    - ${n}`).join("\n")}
 
 rules:
   - GEOSITE,cn,DIRECT
   - GEOIP,CN,DIRECT,no-resolve
   - MATCH,节点列表
 `;
+  return new Response(yaml, {
+    status: 200,
+    headers: { "Content-Type": "text/yaml;charset=utf-8" },
+  });
+}
 
-  return new Response(配置内容);
+function generateInfoResponse(yxIPs) {
+  const count = yxIPs.length || 1;
+  return new Response(`当前订阅包含 ${count} 个节点`, {
+    status: 200,
+    headers: { "Content-Type": "text/plain;charset=utf-8" },
+  });
 }
